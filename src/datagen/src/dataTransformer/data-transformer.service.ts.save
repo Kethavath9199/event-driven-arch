@@ -1,0 +1,911 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import {
+  Address,
+  businessCodeAccountNoMapping,
+  CheckPointFile,
+  ConfirmReturnDelivery,
+  ConfirmReturnDeliveryParameters,
+  ConsigneeAddress,
+  DateConverterSlashesToDashes,
+  DateTimeOffsetToDubaiTime,
+  DeliveredView,
+  DeliverOrderParameters,
+  DeliverySignature,
+  Direction,
+  EcomBusinessCodeLookup,
+  ErrorMessagePayloadModel,
+  findCountryCode,
+  findPaymentModeAndAccountNo,
+  InitiateDeclarationParameters,
+  InvoiceForSubmitOrderParametersForReturn,
+  ModeType,
+  Movement,
+  Order,
+  ReturnOrder,
+  ReturnRequest,
+  SubmitOrder,
+  SubmitOrderParameters,
+  SubmitOrderParametersForReturn,
+  UpdateExitConfirmationParameters,
+  UpdateTransportInfoParameters,
+  YesNo,
+  DateStrFormat
+} from 'core';
+import { v4 as uuidv4 } from 'uuid';
+import { BlessClientService } from '../bless/bless-client/bless-client.service';
+import { SecretsService } from '../secrets/secrets.service';
+const crypto = require('crypto');
+
+@Injectable()
+export class DataTransformerService {
+  private readonly logger = new Logger(this.constructor.name);
+
+  constructor(
+    private configService: ConfigService,
+    private secretsService: SecretsService,
+    private blessClientService: BlessClientService,
+  ) {}
+
+  async transformSubmitOrder(
+    submitOrder: SubmitOrder,
+  ): Promise<SubmitOrderParameters> {
+    const orderDateDubaiTime = this.convertISO8061ToDubaiTime(
+      submitOrder.orderDate,
+      true,
+    );
+    const actionDateDubaiTime = this.convertISO8061ToDubaiTime(
+      submitOrder.actionDate,
+      true,
+    );
+
+    const newInvoices = submitOrder.invoices.map((inv) => {
+      return {
+        ...inv,
+        invoiceDate: this.convertISO8061ToDubaiTime(inv.invoiceDate, false),
+        invoiceType: inv.invoiceType.toString(),
+        paymentInstrumentType: inv.paymentInstrumentType.toString(),
+        lineItems: inv.lineItems,
+      };
+    });
+
+    const payload = {
+      orderNumber: submitOrder.orderNumber,
+      orderDate: orderDateDubaiTime,
+      actionDate: actionDateDubaiTime,
+      ecomBusinessCode: submitOrder.ecomBusinessCode ?? '',
+      mode: submitOrder.mode,
+      billTo: submitOrder.billTo ?? '',
+      shipTo: submitOrder.shipTo ?? '',
+      consigneeAddress:
+        submitOrder.consigneeAddress ?? ({} as ConsigneeAddress),
+      billToAddress: submitOrder.billToAddress ?? ({} as Address),
+      shipToAddress: submitOrder.shipToAddress ?? ({} as Address),
+      documents: submitOrder.documents ?? [],
+      invoices: newInvoices,
+      referenceID: submitOrder.referenceId ?? '',
+      uuid: uuidv4(),
+      consigneeName: submitOrder.consigneeName ?? '',
+      consigneeCode: '',
+      jwt: this.getJwtOrOrgCode(submitOrder),
+      eCommBusinessName: '',
+      kvps: submitOrder.__kvp ? submitOrder.__kvp : [],
+      uuid20: this.generateUUID20(),
+    };
+
+    const { jwt, uuid20, uuid, ...rest } = payload
+      , _logisticsSPBusinessCode = submitOrder.invoices[0]?.logisticsSPBusinessCode ?? ''
+      // conditionally set the vaultKey
+      , _vaultKey = submitOrder.mode === "F" && _logisticsSPBusinessCode && _logisticsSPBusinessCode === "AE-9105338" ?
+        (this.configService.get('HASHICORP_DHL_CODE_LOOKUP') ?? '') :
+        submitOrder.ecomBusinessCode
+      , footer = await this.generateFooter(
+        rest,
+        this.getJwtOrOrgCode(submitOrder),
+        _vaultKey,
+        submitOrder.orderNumber,
+        submitOrder.ecomBusinessCode,
+      );
+    
+    this.logger.debug(`transformSubmitOrder payload - ${JSON.stringify(payload)}`);
+    this.logger.debug(`generateFooter vaultKey - ${_vaultKey}`);
+
+    return {
+      ...payload,
+      ...footer,
+    };
+  }
+
+  async transformSubmitOrderForReturn(
+    submitOrder: ReturnOrder,
+  ): Promise<SubmitOrderParametersForReturn> {
+    const actionDateDubaiTime = this.convertISO8061ToDubaiTime(
+      submitOrder.actionDate,
+      true,
+    );
+
+    const newInvoices: InvoiceForSubmitOrderParametersForReturn[] =
+      submitOrder.invoices.map((inv) => {
+        const { returnDetail, ...restOfInvoice } = inv;
+
+        return {
+          ...restOfInvoice,
+          returnDetail: inv.returnDetail,
+        };
+      });
+
+    const payload = {
+      orderNumber: submitOrder.orderNumber,
+      orderDate: '',
+      actionDate: actionDateDubaiTime,
+      ecomBusinessCode: submitOrder.ecomBusinessCode ?? '',
+      mode: submitOrder.mode,
+      billTo: '',
+      shipTo: '',
+      consigneeAddress: {},
+      billToAddress: {},
+      shipToAddress: {},
+      documents: [],
+      invoices: newInvoices,
+      referenceID: '',
+      uuid: uuidv4(),
+      consigneeName: '',
+      consigneeCode: '',
+      jwt: submitOrder.invoices[0]?.exporterCode ?? '',
+      eCommBusinessName: '',
+      kvps: [],
+      uuid20: this.generateUUID20(),
+    };
+
+    const { jwt, uuid20, uuid, orderDate, ...rest } = payload;
+    const footer = await this.generateFooter(
+      rest,
+      jwt,
+      submitOrder.ecomBusinessCode,
+      submitOrder.orderNumber,
+      submitOrder.ecomBusinessCode,
+    );
+    return {
+      ...payload,
+      ...footer,
+    };
+  }
+
+  async transformUpdateTransportInfo(orderAggregate: {
+    order: Order;
+    pickupFile: CheckPointFile;
+    direction: Direction;
+    movementData: Movement;
+  }): Promise<UpdateTransportInfoParameters> {
+    const movement = orderAggregate.movementData;
+    const returnDetail = orderAggregate.order.invoices[0]?.returnDetail;
+    const newInvoices = orderAggregate.order.invoices.map((inv) => ({
+      invoiceNumber: inv.invoiceNumber,
+    }));
+    const jwtAndOrgCodeValue =
+      orderAggregate.order.invoices[0]?.deliveryProviderBusinessCode ?? '';
+    const businessAccount =
+      EcomBusinessCodeLookup[orderAggregate.order.ecomBusinessCode];
+
+    const dateOfDeparture = movement.shippingDetails.dateOfDeparture
+      , _dateOfDeparture = DateStrFormat(dateOfDeparture);
+    this.logger.debug(`Today - ${new Date()}`);
+    this.logger.debug(`DateOfDeparture modified, pre - ${dateOfDeparture}, post - ${_dateOfDeparture}`);
+
+    const payload = {
+      orderNumber: orderAggregate.order.orderNumber,
+      shippingParameterId: '',
+      ecomOrgCode: orderAggregate.order.ecomBusinessCode ?? '',
+      invoices: newInvoices,
+      direction: orderAggregate.direction,
+      returnRequestNo: returnDetail?.returnRequestNo ?? '',
+      oldHouseTransportDocNo: '',
+      mode: orderAggregate.order.mode,
+      autoInitiateDeclaration:
+        orderAggregate.order.mode === ModeType.Update ? YesNo.No : YesNo.Yes, //TBD
+      shippingDetail: {
+        shippingAgentBusinessCode: jwtAndOrgCodeValue,
+        modeOfTransport: '8',
+        carrierNumber: movement.movementNumber, //movement number
+        carrierRegistrationNo: movement.movementNumber, //movement number
+        dateOfDeparture:
+          DateConverterSlashesToDashes(
+            _dateOfDeparture,
+          ) ?? '', //outbound
+        portOfLoad: this.checkWhichShipmentValueToUse(
+          movement.shippingDetails.portOfLoad,
+        ),
+        portOfDischarge: movement.shippingDetails.portOfDischarge,
+        originalLoadPort: this.checkWhichShipmentValueToUse(
+          movement.shippingDetails.originalLoadPort,
+        ),
+        destinationCountry: findCountryCode(
+          movement.shippingDetails.destinationCountry,
+        ),
+        pointOfExit: 'AFZ',
+        cargoHandlerCode: businessAccount?.cargoHandlerPremiseCode ?? '',
+        LMDBusinessCode: jwtAndOrgCodeValue,
+      },
+      transportDocumentDetails: {
+        masterTransportDocNo: movement.mawb,
+        transportDocNo: movement.airwayBillNumber,
+        cargoType: '1',
+        grossWeight:
+          Math.floor(movement.packageDetails.grossWeight * 10000) / 10000, //floor down to 4 Decimal places
+        grossWeightUOM: movement.packageDetails.grossWeightUOM,
+        netWeight:
+          Math.floor(movement.packageDetails.netWeight * 10000) / 10000, //floor down to 4 Decimal places
+        netWeightUOM: movement.packageDetails.netWeightUOM,
+      },
+      packageDetails: [
+        {
+          packageType: movement.packageDetails.packageType ?? '',
+          numberOfPackages: Number(movement.packageDetails.numberOfPackages),
+          marksAndNumber: '', //Where to retrieve from
+          container: [],
+        },
+      ],
+      documents: orderAggregate.order.documents ?? [],
+      uuid: uuidv4(),
+      jwt: jwtAndOrgCodeValue,
+      transportProviderCode: jwtAndOrgCodeValue,
+      uuid20: this.generateUUID20(),
+      referenceID: movement.referenceID,
+      kvp: [],
+    };
+
+    const { uuid20, uuid, jwt, ...rest } = payload;
+
+    const footer = await this.generateFooter(
+      rest,
+      jwtAndOrgCodeValue,
+      this.configService.get('HASHICORP_DHL_CODE_LOOKUP') ?? '',
+      orderAggregate.order.orderNumber,
+      orderAggregate.order.ecomBusinessCode,
+    );
+
+    return {
+      ...payload,
+      ...footer,
+    };
+  }
+
+  async transformUpdateTransportInfoReturn(
+    orderAggregate: {
+      order: Order;
+      pickupFile: CheckPointFile;
+      direction: Direction;
+      movementData: Movement;
+    },
+    returnRequest: ReturnRequest,
+  ): Promise<UpdateTransportInfoParameters> {
+    const newInvoices = returnRequest.request.invoices.map((inv) => {
+      return {
+        invoiceNumber: inv.invoiceNumber,
+        invoiceDate: new Date(),
+        shippingParameterID: '',
+      };
+    });
+
+    if (!returnRequest.movementData)
+      throw new Error('Movementdata not defined');
+
+    const jwtAndOrgCodeValue =
+      orderAggregate.order.invoices[0]?.deliveryProviderBusinessCode ?? '';
+    const businessAccount =
+      EcomBusinessCodeLookup[returnRequest.request.ecomBusinessCode];
+
+
+    const dateOfArrival = returnRequest.movementData.shippingDetails.dateOfArrival
+      , _dateOfArrival = DateStrFormat(dateOfArrival);
+    this.logger.debug(`Today - ${new Date()}`);
+    this.logger.debug(`DateOfArrival modified, pre - ${dateOfArrival}, post - ${_dateOfArrival}`);
+
+    const payload = {
+      orderNumber: returnRequest.request.orderNumber,
+      shippingParameterId: '',
+      ecomOrgCode: returnRequest.request.ecomBusinessCode,
+      invoices: newInvoices,
+      direction: Direction.Return,
+      returnRequestNo: returnRequest.returns[0]?.returnRequestNo,
+      oldHouseTransportDocNo: orderAggregate.pickupFile.hawb,
+      mode: 'F',
+      autoInitiateDeclaration: YesNo.Yes, //TBD
+      shippingDetail: {
+        shippingAgentBusinessCode: jwtAndOrgCodeValue, //JWT token from business
+        modeOfTransport: '8',
+        dateOfArrival: DateConverterSlashesToDashes(
+          _dateOfArrival
+        ),
+        portOfLoad: returnRequest.movementData.shippingDetails.portOfLoad,
+        portOfDischarge: this.checkWhichShipmentValueToUse(
+          returnRequest.movementData.shippingDetails.portOfDischarge,
+        ),
+        originalLoadPort:
+          returnRequest.movementData.shippingDetails.originalLoadPort,
+        cargoHandlerCode: businessAccount?.cargoHandlerPremiseCode ?? '',
+        carrierNumber: returnRequest.movementData.shippingDetails.carrierNumber,
+        carrierRegistrationNo:
+          returnRequest.movementData.shippingDetails.carrierNumber,
+        destinationCountry: findCountryCode(
+          returnRequest.movementData.shippingDetails.destinationCountry,
+        ),
+        LMDBusinessCode: jwtAndOrgCodeValue,
+      },
+      transportDocumentDetails: {
+        masterTransportDocNo: returnRequest.movementData.mawb,
+        transportDocNo: returnRequest.movementData.airwayBillNumber,
+        cargoType: '1',
+        grossWeight:
+          Math.floor(
+            returnRequest.movementData.packageDetails.grossWeight * 10000,
+          ) / 10000, //floor down to 4 Decimal places
+        grossWeightUOM:
+          returnRequest.movementData.packageDetails.grossWeightUOM,
+        netWeight:
+          Math.floor(
+            returnRequest.movementData.packageDetails.netWeight * 10000,
+          ) / 10000, //floor down to 4 Decimal places
+        netWeightUOM: returnRequest.movementData.packageDetails.netWeightUOM,
+      },
+      packageDetails: [
+        {
+          packageType: returnRequest.movementData.packageDetails.packageType,
+          numberOfPackages: Number(
+            returnRequest.movementData.packageDetails.numberOfPackages,
+          ),
+          marksAndNumber: '',
+          container: [],
+        },
+      ],
+      documents: [],
+      uuid: uuidv4(),
+      transportProviderCode: jwtAndOrgCodeValue,
+      jwt: jwtAndOrgCodeValue,
+      uuid20: this.generateUUID20(),
+      referenceID: returnRequest.movementData.referenceID,
+      kvp: [],
+    };
+    const { jwt, uuid20, uuid, ...rest } = payload;
+    const footer = await this.generateFooter(
+      rest,
+      jwtAndOrgCodeValue,
+      this.configService.get('HASHICORP_DHL_CODE_LOOKUP') ?? '',
+      orderAggregate.order.orderNumber,
+      orderAggregate.order.ecomBusinessCode,
+    );
+
+    return {
+      ...payload,
+      ...footer,
+    };
+  }
+
+  async transformInitiateDeclaration(
+    orderAggregate: {
+      order: Order;
+      direction: Direction;
+    },
+    invoiceId: string,
+  ): Promise<InitiateDeclarationParameters> {
+    const invoice = orderAggregate.order?.invoices?.find(
+      (i) => i.invoiceNumber === invoiceId,
+    );
+    if (!invoice) {
+      throw Error(`Invoice with id: ${invoiceId} not found`);
+    }
+
+    const returnDetail = invoice?.returnDetail;
+    const exporterCd = invoice?.exporterCode ?? '';
+    const lookUpData = findPaymentModeAndAccountNo(exporterCd);
+    const businessAccount =
+      EcomBusinessCodeLookup[orderAggregate.order.ecomBusinessCode];
+
+    const payload = {
+      uuid: uuidv4(),
+      orderNumber: orderAggregate.order.orderNumber,
+      ecomOrgCode: invoice.brokerBusinessCode ?? '',
+      invoiceNumber: invoice.invoiceNumber,
+      shippingParameterID: '',
+      direction: orderAggregate.direction,
+      returnRequestNo: returnDetail?.returnRequestNo ?? '',
+      paymentDetails: [
+        {
+          paymentMode: lookUpData?.paymentMode ?? '',
+          declarationChargesAccount: lookUpData?.accountNo ?? '',
+        },
+      ],
+      tradeType: '1',
+      declarationType: 0,
+      brokerCustomerCode: businessAccount?.brokerCustomerCode ?? 0,
+      prevDeclarationReference: '',
+      prevDeclarationInvoiceNo: '',
+      prevDeclarationItemLineNo: '',
+      declarationDocuments: [
+        {
+          documentCode: '',
+          availabilityStatus: '',
+          nonAvailabilityReason: '',
+          isDepositCollected: '',
+        },
+      ],
+      invoiceItemLineNo: 0,
+      declarantReferenceNo: '',
+      kvp: [],
+      jwt: invoice.brokerBusinessCode ?? '',
+      uuid20: this.generateUUID20(),
+    };
+
+    const { uuid20, jwt, uuid, ...rest } = payload;
+
+    const footer = await this.generateFooter(
+      rest,
+      invoice.brokerBusinessCode ?? '',
+      this.configService.get('HASHICORP_DHL_CODE_LOOKUP') ?? '',
+      orderAggregate.order.orderNumber,
+      orderAggregate.order.ecomBusinessCode,
+    );
+
+    return {
+      ...payload,
+      ...footer,
+    };
+  }
+
+  async transformReturnDeliverOrder(
+    orderAggregate: { order: Order },
+    returnRequest: ReturnRequest,
+  ): Promise<DeliverOrderParameters> {
+    if (
+      !returnRequest.pickupFile ||
+      !returnRequest.deliveredDate ||
+      !returnRequest.deliveredTime
+    )
+      throw Error(`pickup not defined`);
+
+    const businessAccount =
+      EcomBusinessCodeLookup[orderAggregate.order.ecomBusinessCode];
+
+    const jwtAndOrgCodeValue =
+      orderAggregate.order.invoices[0]?.deliveryProviderBusinessCode ?? '';
+    const payload = {
+      orderNumber: returnRequest.request.orderNumber,
+      invoiceNumber: returnRequest.request.invoices[0]?.invoiceNumber ?? '',
+      transportDocNo: returnRequest.pickupFile.hawb,
+      direction: Direction.Return,
+      deliveryDate: this.convertISO8061ToDubaiTime(
+        returnRequest.deliveredDate,
+        false,
+      ),
+      deliverToPersonName: businessAccount?.businessName ?? '',
+      deliveryStatus: returnRequest.deliveredDate ? '1' : '2',
+      deliveryType: '1',
+      ecomOrgCode: orderAggregate.order.ecomBusinessCode,
+      jwt: jwtAndOrgCodeValue,
+      signature: {} as DeliverySignature,
+      returnToFZorCW: '',
+      documents: orderAggregate.order.documents ?? [],
+      uuid: uuidv4(),
+      signaturePODFilePath: '',
+      signaturePODHash: '',
+      transportProviderCode: jwtAndOrgCodeValue,
+    };
+
+    const { uuid, jwt, ...rest } = payload;
+    const footer = await this.generateFooter(
+      rest,
+      jwtAndOrgCodeValue,
+      orderAggregate.order.ecomBusinessCode,
+      orderAggregate.order.orderNumber,
+      orderAggregate.order.ecomBusinessCode,
+    );
+
+    return {
+      ...payload,
+      epochTimeStamp: footer.epochTimeStamp,
+      footerSignature: footer.signature,
+      stringifiedPayload: footer.stringifiedPayload,
+      orgCode: footer.orgCode,
+    };
+  }
+
+  async transformDeliverOrder(orderAggregate: {
+    order: Order;
+    delivered: DeliveredView[];
+    direction: Direction;
+    pickupFile: CheckPointFile;
+  }): Promise<DeliverOrderParameters> {
+    const delivered = orderAggregate.delivered.find(
+      (x) => x.airwayBillNumber === orderAggregate.pickupFile.hawb,
+    );
+    const jwtAndOrgCodeValue =
+      orderAggregate.order.invoices[0]?.deliveryProviderBusinessCode ?? '';
+    const payload = {
+      orderNumber: orderAggregate.order.orderNumber,
+      invoiceNumber: orderAggregate.order.invoices[0]?.invoiceNumber ?? '',
+      transportDocNo: orderAggregate.pickupFile.hawb ?? '',
+      direction: orderAggregate.direction,
+      deliveryDate: delivered?.deliveryDate
+        ? this.convertISO8061ToDubaiTime(
+            delivered.deliveryDate.toString(),
+            false,
+          )
+        : '',
+      deliverToPersonName: orderAggregate.order.shipTo ?? '',
+      deliveryStatus: delivered?.deliveryCode
+        ? delivered.deliveryCode === 'OK'
+          ? '1'
+          : '2'
+        : '',
+      deliveryType: '1',
+      ecomOrgCode: orderAggregate.order.ecomBusinessCode,
+      jwt: jwtAndOrgCodeValue,
+      signature: {} as DeliverySignature,
+      returnToFZorCW: '',
+      documents: orderAggregate.order.documents ?? [],
+      uuid: uuidv4(),
+      signaturePODFilePath: '',
+      signaturePODHash: '',
+      transportProviderCode: jwtAndOrgCodeValue,
+    };
+
+    const { uuid, jwt, ...rest } = payload;
+
+    const footer = await this.generateFooter(
+      rest,
+      jwtAndOrgCodeValue,
+      this.configService.get('HASHICORP_DHL_CODE_LOOKUP') ?? '',
+      orderAggregate.order.orderNumber,
+      orderAggregate.order.ecomBusinessCode,
+    );
+    return {
+      ...payload,
+      epochTimeStamp: footer.epochTimeStamp,
+      footerSignature: footer.signature,
+      stringifiedPayload: footer.stringifiedPayload,
+      orgCode: footer.orgCode,
+    };
+  }
+
+  async transformConfirmReturnDelivery(
+    orderAggregate: {
+      order: Order;
+    },
+    confirmReturnDelivery: ConfirmReturnDelivery,
+  ): Promise<ConfirmReturnDeliveryParameters> {
+    const jwtAndOrgCodeValue =
+      orderAggregate.order.invoices[0]?.logisticsSPBusinessCode ?? '';
+
+    let result;
+
+    if (confirmReturnDelivery.gatePasses) {
+      result = confirmReturnDelivery.gatePasses?.map((data) => {
+        return {
+          gatePassNumber: data.gatePassNumber,
+          gatePassDirection: data.gatePassDirection,
+          actualMovingInDate: data.ActualMovingInDate,
+        };
+      });
+    }
+
+    const payload = {
+      orderNumber: orderAggregate.order.orderNumber,
+      invoiceNumber: confirmReturnDelivery.invoiceNumber,
+      transportDocNo: confirmReturnDelivery.transportDocNo ?? '',
+      returnRequestNo: confirmReturnDelivery.returnRequestNo,
+      gatePasses: result,
+      dateOfReceivingBackGoods: confirmReturnDelivery.dateOfReceivingBackGoods,
+      lineItems: confirmReturnDelivery.lineItems,
+      ecomOrgCode: orderAggregate.order.ecomBusinessCode,
+      uuid: uuidv4(),
+      jwt: jwtAndOrgCodeValue,
+      uuid20: this.generateUUID20(),
+      kvp: confirmReturnDelivery.kvp ? confirmReturnDelivery.kvp : [],
+      transportProviderCode: confirmReturnDelivery.transportProviderCode ?? '',
+    };
+    const { kvp, uuid20, uuid, jwt, ...rest } = payload;
+    const footer = await this.generateFooter(
+      rest,
+      jwtAndOrgCodeValue,
+      this.configService.get('HASHICORP_DHL_CODE_LOOKUP') ?? '',
+      orderAggregate.order.orderNumber,
+      orderAggregate.order.ecomBusinessCode,
+    );
+    return {
+      ...payload,
+      ...footer,
+    };
+  }
+
+  async transformUpdateExitConfirmation(
+    orderAggregate: {
+      order: Order;
+      movementData: Movement;
+      pickupFile: CheckPointFile;
+    },
+    declarationNumber: string,
+  ): Promise<UpdateExitConfirmationParameters> {
+    const order = orderAggregate.order;
+    const orderInvoice = order.invoices[0];
+    const jwtAndOrgCodeValue = orderInvoice?.deliveryProviderBusinessCode ?? '';
+    const movement = orderAggregate.movementData.shippingDetails;
+    const exporterCd = orderInvoice?.exporterCode ?? '';
+
+    // Options 3 is applicable based on given logic
+    const mapping = businessCodeAccountNoMapping[3];
+    this.logger.debug(`exit confirmation data transformer`);
+    this.logger.debug(
+      `date: ${movement.dateOfDeparture}, time: ${movement.timeOfDeparture}, offset: ${movement.movementGMT}`,
+    );
+    const actualDepartureDate = DateTimeOffsetToDubaiTime(
+      movement.dateOfDeparture,
+      movement.timeOfDeparture,
+      movement.movementGMT,
+    );
+    this.logger.debug(`stringified: ${actualDepartureDate}`);
+
+    const payload = {
+      uuid: uuidv4(),
+      transportDocNo: orderAggregate.pickupFile.hawb,
+      referenceID: uuidv4(),
+      transportProviderCode: jwtAndOrgCodeValue,
+      exitData: [
+        {
+          declarationNo: declarationNumber,
+          actualDepartureDate:
+            actualDepartureDate && actualDepartureDate !== 'Invalid Date'
+              ? actualDepartureDate
+              : '10/10/2021 06:16:14',
+          carrierNumber: movement.carrierNumber,
+          pointOfExit: movement.pointOfExit,
+          debitCreditAccountNo:
+            exporterCd == mapping.businessCode ? mapping.accountNo : '',
+        },
+      ],
+      kvp: order.__kvp ?? [],
+      jwt: jwtAndOrgCodeValue,
+      uuid16: uuidv4(),
+    };
+
+    const { kvp, jwt, uuid16, uuid, ...rest } = payload;
+    const footer = await this.generateFooter(
+      rest,
+      jwtAndOrgCodeValue,
+      this.configService.get('HASHICORP_DHL_CODE_LOOKUP') ?? '',
+      orderAggregate.order.orderNumber,
+      orderAggregate.order.ecomBusinessCode,
+    );
+    return {
+      ...payload,
+      ...footer,
+    };
+  }
+
+  private checkWhichShipmentValueToUse(shipmentValue: string): string {
+    const DO4Values = ['ZJF', 'AUH', 'DXH', 'DXB', 'SHJ', 'RAK'];
+    if (DO4Values.includes(shipmentValue)) {
+      return 'D04';
+    } else {
+      return findCountryCode(shipmentValue);
+    }
+  }
+
+  private convertISO8061ToDubaiTime(
+    date: string | undefined,
+    includeTime: boolean,
+  ): string {
+    if (!date) return '';
+    const dateTime = new Date(date)
+      .toLocaleString('en-US', { timeZone: 'Asia/Dubai', hour12: false })
+      .split(', ');
+
+    if (!dateTime || !dateTime[0] || !dateTime[1]) return '';
+
+    const monthDayYear = dateTime[0].split('/');
+    const hourMinSec = dateTime[1]?.split(':');
+
+    if (includeTime)
+      return `${monthDayYear[1].padStart(2, '0')}/${monthDayYear[0].padStart(
+        2,
+        '0',
+      )}/${monthDayYear[2].padStart(2, '0')} ${hourMinSec[0].padStart(
+        2,
+        '0',
+      )}:${hourMinSec[1].padStart(2, '0')}:${hourMinSec[2].padStart(2, '0')}`;
+    // MM-DD-YYYY HH:MM:SS
+    else
+      return `${monthDayYear[2].padStart(2, '0')}-${monthDayYear[0].padStart(
+        2,
+        '0',
+      )}-${monthDayYear[1].padStart(2, '0')}`; // YYYY-MM-DD
+  }
+
+  public getUtcTimeStamp(inputDate?: string): string {
+    let date = new Date();
+    if (inputDate) date = new Date(inputDate);
+    return date.getTime().toString();
+  }
+
+  private async generateFooter(
+    payload: any,
+    orgCode: string,
+    vaultKey: string,
+    orderNumber: string,
+    ecomBusinessCode: string,
+  ) {
+    const signature = await this.getSignature(
+      JSON.stringify(payload),
+      vaultKey,
+      orderNumber,
+      ecomBusinessCode,
+    );
+    return {
+      epochTimeStamp: this.getUtcTimeStamp(),
+      signature,
+      stringifiedPayload: {
+        ...payload,
+      },
+      orgCode,
+    };
+  }
+
+  private async getSignature(
+    payload: string,
+    vaultCode: string,
+    orderNumber: string,
+    ecomBusinessCode: string,
+  ): Promise<string> {
+    const sharedKeyLookup =
+      this.configService.get('HASHICORP_SHARED_KEY_LOOKUP') ?? 'shared';
+       await this.secretsService.fetchSecretsFromHashiCorpVault();    
+       let secrets = this.secretsService.getSecretsFromMemory();
+     this.logger.log(
+          `Vault secrets...: ${JSON.stringify(secrets)}`
+        );
+
+    let sharedSecret = secrets[sharedKeyLookup];
+   // let privateKey = secrets[vaultCode];
+   // let privateKey = "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JSUV2UUlCQURBTkJna3Foa2lHOXcwQkFRRUZBQVNDQktjd2dnU2pBZ0VBQW9JQkFRRERCam9mai8wUHpQYWoKVnREQmJBK0o0TXFkeCt3dHRXZThDTEJqMDN3Sno5Q011enQrS0FaSkRONkdKT3NPNFdQMmFhcWlNZjZFZlpEegpMOFVWRmkxbElGM2hybmRtTGh5VTFPNTVIUVA3T29YM1B4YlFnZmhxVHhZRmloclMvMzQ2cXlvQ2JaTDdabjU3CkMybzhPQkNDVVRYZSs4WGdLWkRYYnZMdSt5RWswemZUak10clJvMWpkUk5vQnpNYkVnN283UmJJWGlxRjdRZ2EKalozZGlFUDgzc2FxUmJYUUVZWThKdldvVnJqYXREUWpoRC9XVnRzemZLZHhiVENRck1pbHNQeFBEc0t6MUVYYQo2SytlMzZpRXVyUW5KYytMZHorOWFwU24ySlo1MStoRmlSbmtnU1ZyY2lQWGU2bGhqdlM4MG5KWDVCOXV0dFZOCndMd2V6SXlaQWdNQkFBRUNnZ0VBSW8xSTRPeW12aFRuSVhzeEV3T3RJUlZsY0Z6S09ETHFoUUxaRldhVGxEMXcKU202bGxLMU1wOGFTNmh0Q1ZlbVN4MFpqUjhjcHU1bHZnOVpUeVcrYmJVNDFzOVV3TERkQk14RWlpdXljRnZlQQpZcFNYMnlzYnN1SCtHYzhrLzNycWgwUnA5ZklwMTBhS1pBeGFydjZUMWpMREk1VmhzbHhLNEJBMUZDZ0Q4RHo0CmNZY1RRWXBYbWtHdUxEM0hMRFVodnFJV2xrS0cxL2tmVkhlMjBYUDMwSVBLc003K2RJT3h1N1JKSkZ0QnVGWUcKTHBOOHV6OSttOGVOZ3dSSG1nbjF2RnhIbDlQVzZqWHdBZG9qZTJIYVVTR2hoWHlBMlNqTUdsd2J5WnErM1V6aApzU2lUalBybnlTYndqOWJ3akVjdCs2d091c3Nqb0FrWExhS3hLOGVsL1FLQmdRRG1pdkE4ZFhrZ0JIaHZMamZnCldzWlVLNmFqZWM5Z1paZTZoakUyTWxxaDhjdDZ6bHd0VGhNQ2FyUUZMSWtFa3NXOG9OUnlGa0lOUFU3MTFuTDMKWnVGdE1MSFhsZnd1WnFjcnNCak9BT2RxcXg5Tms5SEdua3BFTXdqRHZYMGw3d1VwS1F0UDRaRmtvNUtYYVhBdAo1dmMza2Zyd2lGc2dxSzMwalhLTHFrYUVMd0tCZ1FEWWp6MzZIMGlnN2FHdkRackdDbS9ORnFsbHNnN2k4UDh0Ck9OYW50dTlBelBtRWdtSE1zUFFKWUdMWkFxUUNlTzJOSzZYMnA4SGM1M2dJak9TdzFVV1RHV2lmVkcrS0l0NkUKcEZaMGprN2xxSHd3TTlER2dNdVhMS0VMOGNhUGtCa3JEc1dFa2VMV2lubTNBbkIwTXI1K1lMUlBQRmhldVEzOQpCZGtOWGNZaHR3S0JnRlg2TU5mTFU2M09IUUFSczRMM040bkNjYlg3d293SHQwczNxbmkwMUxvYWk3RXo3b3B5CjJJSUpPelBHeFI2d2dnL3p4dWI1U0E3WjgyMlpXV3pNc0h0aE1xSGM3Sng5YWhEUDdxQTlGQkRpMnB5NjZQdnkKb20zR3Zwa0pQUGY5cU9ZTnlZc3o2MTRsNXBDVElPUHRnL3IwZFNwcEg5c1JMVGJMM1pFYW9vdS9Bb0dBRVhydQplOFFPcnI2L3NFdWUxS0YvQ01UdGc0SHQ1YStpU1ZvdktYYUF0WEJXSzdZQ2d1MDlwWXdjTG53aUZQa0I0OFZFCkxqYTRWVVp4eis3ZmZzNllRUmxwOG9KMFJtZ3VJZkxKNzdxVTc4QzcxWUE1Tit5cGdsaGQzNEx5amlBSmlBbzMKTTA0N1N5bitUU0ZyUmxYYVBvVTd5TEdNU0lrVGNmc0kzQ1ZYbXQwQ2dZRUFyd25vYkpBVnRobTg5TGw2djlqSQpDTXVkUHdvTzdoSFc3cmFCS1hIemNnbnZnTkFhUlYxNWVXZ3hKdUlsWHB6K0pyR2NXYTVlVlNwcjd2dGw5aEh2CjBZc1RSUVNNeE9wVTdUY2xaaTBoRWhOWmdXdC9tY1RRejNWbEE1QWpRdkdwZ1FGODdTOVhrVW5tV0xvSHFid24KWG1SNkJYaDRpWWNiaER3UTNPR0F2eW89Ci0tLS0tRU5EIFBSSVZBVEUgS0VZLS0tLS0=" 
+   let privateKey = `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDDBjofj/0PzPaj
+VtDBbA+J4Mqdx+wttWe8CLBj03wJz9CMuzt+KAZJDN6GJOsO4WP2aaqiMf6EfZDz
+L8UVFi1lIF3hrndmLhyU1O55HQP7OoX3PxbQgfhqTxYFihrS/346qyoCbZL7Zn57
+C2o8OBCCUTXe+8XgKZDXbvLu+yEk0zfTjMtrRo1jdRNoBzMbEg7o7RbIXiqF7Qga
+jZ3diEP83saqRbXQEYY8JvWoVrjatDQjhD/WVtszfKdxbTCQrMilsPxPDsKz1EXa
+6K+e36iEurQnJc+Ldz+9apSn2JZ51+hFiRnkgSVrciPXe6lhjvS80nJX5B9uttVN
+wLwezIyZAgMBAAECggEAIo1I4OymvhTnIXsxEwOtIRVlcFzKODLqhQLZFWaTlD1w
+Sm6llK1Mp8aS6htCVemSx0ZjR8cpu5lvg9ZTyW+bbU41s9UwLDdBMxEiiuycFveA
+YpSX2ysbsuH+Gc8k/3rqh0Rp9fIp10aKZAxarv6T1jLDI5VhslxK4BA1FCgD8Dz4
+cYcTQYpXmkGuLD3HLDUhvqIWlkKG1/kfVHe20XP30IPKsM7+dIOxu7RJJFtBuFYG
+LpN8uz9+m8eNgwRHmgn1vFxHl9PW6jXwAdoje2HaUSGhhXyA2SjMGlwbyZq+3Uzh
+sSiTjPrnySbwj9bwjEct+6wOussjoAkXLaKxK8el/QKBgQDmivA8dXkgBHhvLjfg
+WsZUK6ajec9gZZe6hjE2Mlqh8ct6zlwtThMCarQFLIkEksW8oNRyFkINPU711nL3
+ZuFtMLHXlfwuZqcrsBjOAOdqqx9Nk9HGnkpEMwjDvX0l7wUpKQtP4ZFko5KXaXAt
+vc3kfrwiFsgqK30jXKLqkaELwKBgQDYjz36H0ig7aGvDZrGCm/NFqllsg7i8P8t
+//ONantu9AzPmEgmHMsPQJYGLZAqQCeO2NK6X2p8Hc53gIjOSw1UWTGWifVG+KIt6E
+//pFZ0jk7lqHwwM9DGgMuXLKEL8caPkBkrDsWEkeLWinm3AnB0Mr5+YLRPPFheuQ39
+//BdkNXcYhtwKBgFX6MNfLU63OHQARs4L3N4nCcbX7wowHt0s3qni01Loai7Ez7opy
+//2IIJOzPGxR6wgg/zxub5SA7Z822ZWWzMsHthMqHc7Jx9ahDP7qA9FBDi2py66Pvy
+//om3GvpkJPPf9qOYNyYsz614l5pCTIOPtg/r0dSppH9sRLTbL3ZEaoou/AoGAEXru
+//e8QOrr6/sEue1KF/CMTtg4Ht5a+iSVovKXaAtXBWK7YCgu09pYwcLnwiFPkB48VE
+//Lja4VUZxz+7ffs6YQRlp8oJ0RmguIfLJ77qU78C71YA5N+ypglhd34LyjiAJiAo3
+//M047Syn+TSFrRlXaPoU7yLGMSIkTcfsI3CVXmt0CgYEArwnobJAVthm89Ll6v9jI
+//CMudPwoO7hHW7raBKXHzcgnvgNAaRV15eWgxJuIlXpz+JrGcWa5eVSpr7vtl9hHv
+//0YsTRQSMxOpU7TclZi0hEhNZgWt/mcTQz3VlA5AjQvGpgQF87S9XkUnmWLoHqbwn
+//XmR6BXh4iYcbhDwQ3OGAvyo=
+//-----END PRIVATE KEY-----`
+    if (!privateKey)
+      this.logger.error(`Private key not found for ${vaultCode}`);
+    if (!sharedSecret) this.logger.error(`Shared secret not found`);
+
+    if (!privateKey || !sharedSecret) {
+      this.logger.warn(
+        `Vault private key(s) not found. Refetching all private keys from HashiCorp Vault.`,
+      );
+      await this.secretsService.fetchSecretsFromHashiCorpVault();
+      secrets = this.secretsService.getSecretsFromMemory();
+
+      this.logger.log(
+          `Vault secrets: ${JSON.stringify(secrets)}`
+        )
+      privateKey = secrets[vaultCode];
+      sharedSecret = secrets[sharedKeyLookup];
+      if (!privateKey || !sharedSecret) {
+        this.logger.error(
+          `Vault private key(s) still not found after refetch. Sending error to Bless.`,
+        );
+        await this.postErrorToBless(
+          404,
+          `Private key not found in HashiCorp Vault for private key identifier ${vaultCode}`,
+          orderNumber,
+          ecomBusinessCode,
+        );
+      } else {
+        this.logger.log(
+          `Missing private key(s) successfully refetched from HashiCorp Vault`,
+        );
+      }
+    }
+
+    this.logger.log(`Entity's key: ${sharedKeyLookup}`);
+    this.logger.log(`Vault code: ${vaultCode}`);
+    console.log(`Vault privateKey:  ${JSON.stringify(privateKey,)} sharedSecret:  ${JSON.stringify(sharedSecret)}`)
+    console.log(`Vault payload : ${JSON.stringify(payload)}`)
+    return this.generateSignature(privateKey, payload, sharedSecret);
+  }
+
+  private getJwtOrOrgCode(submitOrder: SubmitOrder): string {
+    // returns 'exporterCode' in case the either/ or contion satisfies, default is 'logisticsSPBusinessCode'
+    const _logisticsSPBusinessCode = submitOrder.invoices[0]?.logisticsSPBusinessCode ?? '';
+    
+    if (
+      _logisticsSPBusinessCode &&
+      (
+       (['AE-9105340', 'AE-9105341'].includes(_logisticsSPBusinessCode)) ||
+       (submitOrder.mode === ModeType.Basic && _logisticsSPBusinessCode === 'AE-9105338')
+      )
+    ) {
+      return submitOrder.invoices[0]?.exporterCode ?? '';
+    }
+    return _logisticsSPBusinessCode;
+  }
+
+  private generateUUID20(): string {
+    return uuidv4().replace('-', '').slice(0, 20);
+  }
+
+  private generateSignature(
+    privateKey: string,
+    payload: string,
+    sharedSecret: string,
+  ): string {
+    try {
+      const hash = crypto
+        .createHmac('sha512', sharedSecret)
+        .update(payload)
+        .digest();
+       console.log("hash created", JSON.stringify(hash));
+      const signer = crypto.createSign('RSA-SHA512');
+       console.log("signer created", JSON.stringify(signer));
+      signer.write(hash);
+       console.log("hash wirte", JSON.stringify(hash));
+      signer.end();
+       console.log("signature started", JSON.stringify(privateKey));
+      return signer.sign(
+        {
+          key: privateKey,
+        },
+        'hex',
+      );
+    } catch (error) {
+      this.logger.error(
+        'Creation of signature went wrong, defaulting to empty string. Error: ' +
+          error,
+      );
+      return '';
+    }
+  }
+
+  private async postErrorToBless(
+    errorCode: number,
+    errorMessage: string,
+    orderNumber: string,
+    ecomBusinessCode: string,
+  ): Promise<void> {
+    const errorMessagePayload: ErrorMessagePayloadModel = {
+      id: uuidv4(),
+      errorCode: errorCode.toString(),
+      dateTime: Date.now().toString(),
+      errorDesc: errorMessage,
+      msgIdentifier: {
+        orderNumber: orderNumber,
+        ecomBusinessCode: ecomBusinessCode,
+      },
+    };
+    await this.blessClientService.post(
+      errorMessagePayload,
+      'EXCEPTION',
+      'BUSINESS',
+    );
+  }
+}
